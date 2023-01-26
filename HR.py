@@ -6,8 +6,10 @@ import torchattacks
 import warnings
 import mosek
 import os
+import time
+import warnings
+warnings.filterwarnings("ignore")
 os.environ['MOSEKLM_LICENSE_FILE'] = "mosek.lic"
-
 
 class HR_Neural_Networks:
 
@@ -32,11 +34,7 @@ class HR_Neural_Networks:
         self.numerical_eps = 0.000001
         self.noise_set = noise_set
         self.learning_approach = learning_approach
-        
-        self.primary_solver = cp.ECOS # Fastest solver for conic problems
-        self.secondary_solver = cp.MOSEK # Commercial solver (faster when r = 0)
-        self.third_solver = cp.SCS # Most reliable for conic problems, but also slowest
-
+ 
         if loss_fn == None:
             raise warnings.warn(
                 "Loss is defaulted to cross entropy loss. Consider changing if not doing classification.")
@@ -52,9 +50,8 @@ class HR_Neural_Networks:
             self.α_choice = α_choice
         
         # Handling choice of r
-        if r_choice == 0:
-            self.r_choice = self.numerical_eps
-            self.primary_solver = cp.MOSEK
+        if r_choice == 0 and α_choice != 0:
+            self.r_choice = 0.001 # For numerical stability. 0 or very small values of r cause problems.
         else:
             self.r_choice = r_choice
             
@@ -237,6 +234,8 @@ class HR_Neural_Networks:
             
             self.train_batch_size = batch_size
             
+            
+            
             if self.learning_approach == "HR":
 
                 self._initialise_HR_problem()
@@ -249,28 +248,36 @@ class HR_Neural_Networks:
 
             self.nn_loss.value = np.array(inf_loss.cpu().detach().numpy()) # DPP step
             self.worst.value = np.max(self.nn_loss.value) # DPP step
-
+            
+            start = time.time()
+            
             try:
-                self.model.solve(solver=self.primary_solver) 
+                self.model.solve(solver=cp.ECOS) 
                 # ECOS is normally faster than MOSEK for conic problems (it is built for this purpose),
                 # but generally also more unstable. 
                 # We will revert to MOSEK incase of solving issues.
                 # This should happen very infrequently (<1/1000 calls or so, depending on α, r)
                 
             except:
-                self.nn_loss.value += self.numerical_eps # Small amt of noise incase its a numerical issue
-                self.worst.value = np.max(self.nn_loss.value) # Must also re-instate worst-case for DPP
-                self.model.solve(solver=self.secondary_solver)
-                # MOSEK is the second fastest,
-                # But also occasionally fails when α and r are too large.
-            finally:
-                self.model.solve(solver=self.third_solver)
-                # SCS is the slowest,
-                # but also the most reliable for conic problems.
+                
+                try:
+                    self.nn_loss.value += self.numerical_eps # Small amt of noise incase its a numerical issue
+                    self.worst.value = np.max(self.nn_loss.value) # Must also re-instate worst-case for DPP
+                    self.model.solve(solver=cp.MOSEK)
+                    
+                    # MOSEK is the second fastest,
+                    # But also occasionally fails when α and r are too large.
+                
+                except:
+                    self.model.solve(solver=cp.SCS)
+                    # Rarely do we need this here, but can be a good error catch.
+ 
 
             weights = Variable(torch.from_numpy(self.p.value),
                                requires_grad=True).to(device).float() # Converting primal weights to tensors
-
+            
+            
+    
             return torch.dot(weights[0:batch_size], inf_loss) + torch.max(inf_loss)*weights[batch_size]
 
         else: # If we use only epsilon (could be zero or not)
